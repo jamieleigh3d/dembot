@@ -92,6 +92,9 @@ def safe_cast_to_int(value, default=0):
 
 def safe_cast_to_bool(value, default=False):
     try:
+        # Convert string values like "True" or "False" to actual boolean values
+        if isinstance(value, str):
+            return value.lower() in ['true', '1', 'yes']
         return bool(value)
     except (TypeError, ValueError):
         return default
