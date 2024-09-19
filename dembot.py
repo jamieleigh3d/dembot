@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 import logging
 import boto3
 import signal
+import asyncio
+from typing import List
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -40,21 +42,84 @@ url_regex = re.compile(r'https?://[^\s]+')
 class ServerSettings:
     def __init__(self, 
                 logging_channel_id=None, 
-                link_check_enabled=False):
+                link_check_enabled=False, 
+                 authorized_role_ids=None):
         self.logging_channel_id = logging_channel_id
         self.link_check_enabled = link_check_enabled
+        self.authorized_role_ids = authorized_role_ids or []
 
+def has_authorized_role(interaction: discord.Interaction, authorized_role_ids):
+    """Check if the user has any role in the authorized roles list."""
+    user_roles = [role.id for role in interaction.user.roles]
+    return any(role_id in user_roles for role_id in authorized_role_ids)
+
+@bot.command()
+@commands.guild_only()
+@commands.is_owner()
+async def sync(ctx):
+    # Sync only the current guild
+    synced = await ctx.bot.tree.sync(guild=ctx.guild)
+    await ctx.send(f"Synced {len(synced)} commands to this server.")
+    
+# Slash command to delegate one role at a time with Manage Server permission required
+@bot.tree.command(name="dembot-delegate-roles", description="Delegate a role authorized to run certain dembot commands")
+@app_commands.describe(role="A role to be authorized")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def dembot_delegate_roles(interaction: discord.Interaction, role: discord.Role):
+    guild_id = interaction.guild.id
+    settings = get_server_settings(guild_id)
+
+    # Append the role to the list of authorized roles
+    if role.id not in settings.authorized_role_ids:
+        settings.authorized_role_ids.append(role.id)
+        save_server_settings(guild_id, settings)
+        await interaction.response.send_message(f"Authorized role for Dembot commands: {role.mention}")
+    else:
+        await interaction.response.send_message(f"{role.mention} is already an authorized role.")
+
+# Handle errors for dembot_delegate_roles
+@dembot_delegate_roles.error
+async def dembot_delegate_roles_error(interaction: discord.Interaction, error):
+    if isinstance(error, MissingPermissions):
+        await interaction.response.send_message("You need the **Manage Server** permission to use this command.", ephemeral=True)
+
+# Slash command to clear all delegated roles
+@bot.tree.command(name="dembot-clear-delegated-roles", description="Clear all roles authorized to run certain dembot commands")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def dembot_clear_delegated_roles(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    settings = get_server_settings(guild_id)
+
+    # Clear the authorized roles list
+    settings.authorized_role_ids = []
+    save_server_settings(guild_id, settings)
+
+    # Send a confirmation message
+    await interaction.response.send_message("All authorized roles have been cleared.")
+
+# Handle errors for dembot_clear_delegated_roles command
+@dembot_clear_delegated_roles.error
+async def dembot_clear_delegated_roles_error(interaction: discord.Interaction, error):
+    if isinstance(error, MissingPermissions):
+        await interaction.response.send_message("You need the **Manage Server** permission to use this command.", ephemeral=True)
+
+        
 # Slash command to set the logging channel
 @bot.tree.command(name="dembot-logging", description="Set the channel where dembot logs potential fundraising links")
 @app_commands.describe(channel="The channel where logs should be sent")
-@app_commands.checks.has_permissions(manage_guild=True)
 async def dembot_logging(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = interaction.guild.id
     settings = get_server_settings(guild_id)
-    settings.logging_channel_id = channel.id
-    save_server_settings(guild_id, settings)
 
     try:
+        # Check if the user has Manage Server permission or an authorized role
+        if not interaction.user.guild_permissions.manage_guild and not has_authorized_role(interaction, settings.authorized_role_ids):
+            await interaction.response.send_message("You don't have permission to run this command.", ephemeral=True)
+            return
+
+        settings.logging_channel_id = channel.id
+        save_server_settings(guild_id, settings)
+    
         await interaction.response.send_message(f"Logging channel set to {channel.mention}")
     except discord.errors.Forbidden:
         logging.error(f"Bot does not have permission to respond in this channel for guild {guild_id}")
@@ -67,15 +132,20 @@ async def dembot_logging_error(interaction: discord.Interaction, error):
     
 @bot.tree.command(name="dembot-link-check", description="Enables or disables the fundraising link checking feature of dembot for this server")
 @app_commands.describe(enabled="True to enable, False to disable")
-@app_commands.checks.has_permissions(manage_guild=True)
 async def dembot_link_check(interaction: discord.Interaction, enabled: str):
     guild_id = interaction.guild.id
     settings = get_server_settings(guild_id)
-    settings.link_check_enabled = safe_cast_to_bool(enabled)
-    save_server_settings(guild_id, settings)
     
     try:
-        await interaction.response.send_message(f"Link check set to {settings.link_check_enabled} (Parsed from: '{enabled}')")
+        # Check if the user has Manage Server permission or an authorized role
+        if not interaction.user.guild_permissions.manage_guild and not has_authorized_role(interaction, settings.authorized_role_ids):
+            await interaction.response.send_message("You don't have permission to run this command.", ephemeral=True)
+            return
+    
+        settings.link_check_enabled = safe_cast_to_bool(enabled)
+        save_server_settings(guild_id, settings)
+
+        await interaction.response.send_message(f"Link check set to {settings.link_check_enabled} (Parsed from: '{enabled}')")    
     except discord.errors.Forbidden:
         logging.error(f"Bot does not have permission to respond in this channel for guild {guild_id}")
 
@@ -89,8 +159,11 @@ async def dembot_link_check_error(interaction: discord.Interaction, error):
 @bot.event
 async def on_ready():
     # Sync the slash commands to the server
-    await bot.tree.sync()
-    logging.info(f"Slash commands synced for {bot.user}")
+    guild = discord.Object(id=769864349594419241) # ID for Fortunae Beta test server
+    await bot.tree.sync(guild=guild)
+    
+    #await bot.tree.sync()
+    #logging.info(f"Slash commands synced for {bot.user}")
     logging.info(f'Logged in as {bot.user}')
 
 def safe_cast_to_int(value, default=0):
@@ -122,8 +195,12 @@ def get_server_settings(guild_id):
             # Get the ChannelID as an integer, or else None
             logging_channel_id = safe_cast_to_int(item.get('LinkLoggingChannelID', None), None)
             
+            # Roles authorized to perform configuration slash commands
+            authorized_role_ids = item.get('DembotAuthorizedRoleIds', [])
+            
             return ServerSettings(link_check_enabled=link_check_enabled,
-                                  logging_channel_id=logging_channel_id)
+                                  logging_channel_id=logging_channel_id,
+                                  authorized_role_ids=authorized_role_ids)
         else:
             logging.warning(f"No server settings found for guild {guild_id}, using defaults")
             return ServerSettings()
@@ -138,7 +215,8 @@ def save_server_settings(guild_id, settings : ServerSettings):
             Item={
                 'GuildID': str(guild_id),
                 'LinkCheckEnabled': settings.link_check_enabled,
-                'LinkLoggingChannelID': settings.logging_channel_id
+                'LinkLoggingChannelID': settings.logging_channel_id,
+                'DembotAuthorizedRoleIds': settings.authorized_role_ids
             }
         )
     except Exception as e:
@@ -227,13 +305,19 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-def shutdown():
+# Async shutdown function
+async def shutdown():
     logging.info("Shutting down the bot")
-    bot.close()
+    await bot.close()
 
-# Add a signal handler for graceful shutdowns
-signal.signal(signal.SIGINT, lambda s, f: shutdown())
-signal.signal(signal.SIGTERM, lambda s, f: shutdown())
+# Function to handle signals and call the async shutdown
+def handle_shutdown():
+    loop = asyncio.get_event_loop()
+    loop.create_task(shutdown())
+
+# Add signal handlers for graceful shutdowns
+signal.signal(signal.SIGINT, lambda s, f: handle_shutdown())
+signal.signal(signal.SIGTERM, lambda s, f: handle_shutdown())
     
 bot.run(TOKEN)
 
