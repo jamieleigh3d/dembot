@@ -4,6 +4,7 @@ import pytz
 from dataclasses import dataclass
 from datetime import datetime
 from collections import defaultdict
+import os
 
 @dataclass
 class ScheduleEntry:
@@ -15,10 +16,10 @@ class ScheduleEntry:
     role: str  # e.g., 'Moderator', 'Lead Moderator'
 
 class ScheduleSheet:
-    def __init__(self):
-        # TODO Load sheet_url and cred_json from .env environment variables
-        self.sheet_url = 'https://docs.google.com/spreadsheets/d/1QfeZwpE5T1Iq0MYw8O5C6Mb7Cdx5K8tYq1wSAW_ABPw/edit?usp=sharing'
-        self.cred_json = 'dembot-436603-eba25362d502.json'
+    def __init__(self, sheet_url=None, cred_json=None):
+        # Use provided parameters or fallback to environment variables
+        self.sheet_url = sheet_url or os.getenv('SCHEDULE_SHEET_URL')
+        self.cred_json = cred_json or os.getenv('GOOGLE_CREDENTIALS_JSON')
         self.client = self._get_client()
         
     def _get_client(self):
