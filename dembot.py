@@ -218,7 +218,7 @@ def extract_discord_tag(text):
     return None
         
 @bot.tree.command(name="mod-checkin", description="Check in for your moderator shift")
-#@app_commands.checks.has_any_role('Moderator', 'Community Moderator')
+@app_commands.checks.has_any_role('Moderator', 'Community Moderator')
 async def mod_checkin(interaction: discord.Interaction):
     global schedule_entries
     user_id = interaction.user.id
@@ -244,7 +244,12 @@ async def mod_checkin(interaction: discord.Interaction):
 
     # Save check-in time to DynamoDB
     #check_in_mod(user_id, guild_id, current_time)
+    user_display_name = interaction.user.display_name
+    user_name = interaction.user.name
+    user_tag = str(interaction.user)  # e.g., "username#1234"
 
+    logging.info(f"A mod checked in! user_id {user_id} Display name: {user_display_name} Username: {user_name} Tag: {user_tag}")
+    
     if shift_found:
         await interaction.response.send_message(f"Thank you, {interaction.user.mention}. You are now checked in for your scheduled shift.")
     else:
