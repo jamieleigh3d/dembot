@@ -223,7 +223,7 @@ def save_server_settings(guild_id, settings : ServerSettings):
         logging.error(f"Error saving server settings for guild {guild_id}: {e}")
 
 # Log a message with a link to the logging channel, if one is set
-async def log_link(message, link, settings):
+async def log_link(message, link, settings, matched_keywords, matched_url_keywords):
     guild_id = message.guild.id
     channel_id = settings.logging_channel_id
 
@@ -232,30 +232,34 @@ async def log_link(message, link, settings):
         logging_channel = bot.get_channel(channel_id)
 
         if logging_channel:
-            # Send a message to the logging channel quoting the link
-            # Create a link to the original message
             message_link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
 
+            # Truncate message content if necessary
             if len(message.content) > 2000:
                 message_content = message.content[:1997] + "..."
             else:
                 message_content = message.content
-                
+
             # Create an embed with the original message content
             embed = discord.Embed(
-                title="Potential Donate Link Detected",
+                title="Potential Fundraising Link Detected",
                 description=message_content,
                 color=discord.Color.blue()
             )
             embed.add_field(name="Author", value=message.author.mention, inline=True)
-            embed.add_field(name="Original Message", value=f"[Original message]({message_link})", inline=False)
+            if matched_keywords:
+                embed.add_field(name="Keywords Detected", value=", ".join(matched_keywords), inline=True)
+            if matched_url_keywords:
+                embed.add_field(name="Keywords in Links Detected", value=", ".join(matched_url_keywords), inline=True)
+            embed.add_field(name="Analyzed Link", value=link, inline=False)
+            embed.add_field(name="Original Message", value=f"[Jump to message]({message_link})", inline=False)
             embed.set_footer(text=f"Posted in #{message.channel.name}")
 
             # Send the embed message to the logging channel
             try:
                 await logging_channel.send(embed=embed)
             except discord.errors.Forbidden:
-                logging.error(f"Bot does not have permission to respond in the logging channel for guild {guild_id}")
+                logging.error(f"Bot does not have permission to send messages in the logging channel for guild {guild_id}")
         else:
             logging.warning(f"Logging channel not found for guild {guild_id}")
 
@@ -272,17 +276,37 @@ async def run_link_check(message, settings):
                 
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.content, 'html.parser')
-                    
-                    # Check for 'Donate' keyword in text or links
-                    donate_buttons = soup.find_all(string=re.compile(r"donate", re.I))
-                    donate_links = soup.find_all('a', href=re.compile(r"donate", re.I))
 
-                    if donate_buttons or donate_links:
-                        logging.info(f"Potential donate button or link found in {link}")
-                        await log_link(message, link, settings)
+                    # Define the keywords to search for
+                    keywords = ["donate", "donation", "fundraise", "fundraising", "merch", "add to cart"]
+
+                    # Build the regex pattern with word boundaries
+                    pattern = re.compile(r'(' + '|'.join(map(re.escape, keywords)) + r')', re.I)
+
+                    # Initialize a set to store matched keywords
+                    matched_keywords = set()
+                    matched_url_keywords = set()
+
+                    # Check for keywords in text
+                    donate_buttons = soup.find_all(string=pattern)
+                    for element in donate_buttons:
+                        matches = pattern.findall(element)
+                        matched_keywords.update(matches)
+
+                    # Check for keywords in link href attributes
+                    donate_links = soup.find_all('a', href=pattern)
+                    for a_tag in donate_links:
+                        href = a_tag.get('href', '')
+                        matches = pattern.findall(href)
+                        matched_url_keywords.update(matches)
+
+                    if matched_keywords or matched_url_keywords:
+                        logging.info(f"Potential fundraising-related content found in {link}")
+                        await log_link(message, link, settings, matched_keywords, matched_url_keywords)
                         break
                     else:
-                        logging.info(f"No donate button or link found in {link}")
+                        logging.info(f"No fundraising-related content found in {link}")
+                        
             except requests.exceptions.Timeout:
                 logging.error(f"Timeout error accessing {link}")
             except requests.exceptions.TooManyRedirects:
