@@ -74,10 +74,31 @@ class ModeratorTracker:
 
     def check_in_moderator(self, moderator: CheckedInModerator):
         """
-        Adds a moderator to the tracker.
+        Adds a moderator to the tracker, preserving check-in time if already checked in.
 
         :param moderator: An instance of CheckedInModerator
         """
+        # Check if the moderator is already checked in
+        existing_moderator = None
+        existing_group = None
+
+        for group, group_mods in self.moderators.items():
+            if moderator.user_id in group_mods:
+                existing_moderator = group_mods[moderator.user_id]
+                existing_group = group
+                break
+
+        if existing_moderator:
+            # Preserve the existing check_in_time
+            moderator.check_in_time = existing_moderator.check_in_time
+            # Remove from old group if group has changed
+            if existing_group != moderator.group:
+                del self.moderators[existing_group][moderator.user_id]
+        else:
+            # New check-in; check_in_time is already set in the moderator instance
+            pass
+
+        # Add/update the moderator in the tracker
         self.moderators[moderator.group][moderator.user_id] = moderator
 
     def check_out_moderator(self, user_id, group):
@@ -177,7 +198,7 @@ class ModeratorTracker:
                 else:
                     embed.add_field(name=group, value="None", inline=True)
         else:
-            embed.add_field(name="\n**Scheduled Moderators**", value="No scheduled mods at this time.", inline=False)
+            embed.add_field(name="**Scheduled Moderators**", value="No scheduled mods at this time.", inline=False)
 
         # Checked-in moderators
         embed.add_field(name="\n**Checked-In Moderators**", value="\u200b", inline=False)
@@ -185,7 +206,9 @@ class ModeratorTracker:
             group_mods = self.moderators.get(group, {})
             if group_mods:
                 # Get display names, sorted alphabetically
-                names = sorted([mod.display_name for mod in group_mods.values()])
+                time_str = mod.check_in_time.time().strftime('%I:%M')
+                time_str2 = mod.shift_end_time.time().strftime('%I:%M %p')
+                names = sorted([f"{mod.display_name} ({time_str}-{time_str2})" for mod in group_mods.values()])
                 embed.add_field(name=group, value=", ".join(names), inline=True)
             else:
                 embed.add_field(name=group, value="¯\\_(ツ)_/¯", inline=True)
@@ -282,7 +305,7 @@ class ModeratorTracker:
 
         # Determine the user's group based on schedule or default to 'Floating'
         group = 'Floating'  # Default group
-        shift_duration = 2  # Default shift duration in hours
+        shift_duration = 1  # Default shift duration in hours
 
         # Find the user's scheduled shift
         user_schedule = self.schedule_entries.get(current_date, [])
@@ -292,8 +315,8 @@ class ModeratorTracker:
                 if entry.shift_start_datetime <= current_time_est <= entry.shift_end_datetime:
                     group = entry.role  # 'Mod' or 'Lead Mod' or 'Overflow'
                     # Calculate actual shift duration
-                    shift_start_datetime = datetime.combine(current_date, entry.shift_start, tzinfo=eastern)
-                    shift_end_datetime = datetime.combine(current_date, entry.shift_end, tzinfo=eastern)
+                    shift_start_datetime = entry.shift_start_datetime
+                    shift_end_datetime = entry.shift_end_datetime
                     shift_duration = (shift_end_datetime - shift_start_datetime).total_seconds() / 3600
                     break
 

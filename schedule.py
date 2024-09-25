@@ -131,7 +131,7 @@ class ScheduleSheet:
             
             if overflow_mod_name and overflow_mod_name != 'Not available':
                 overflow_entry = ScheduleEntry(
-                    moderator_name=lead_mod_name,
+                    moderator_name=overflow_mod_name,
                     discord_username='',
                     shift_start_datetime=shift_start_datetime,
                     shift_end_datetime=shift_end_datetime,
