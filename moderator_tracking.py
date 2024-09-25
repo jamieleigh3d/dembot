@@ -206,9 +206,7 @@ class ModeratorTracker:
             group_mods = self.moderators.get(group, {})
             if group_mods:
                 # Get display names, sorted alphabetically
-                time_str = mod.check_in_time.time().strftime('%I:%M')
-                time_str2 = mod.shift_end_time.time().strftime('%I:%M %p')
-                names = sorted([f"{mod.display_name} ({time_str}-{time_str2})" for mod in group_mods.values()])
+                names = sorted([f"{mod.display_name} ({mod.check_in_time.time().strftime('%I:%M')}-{mod.shift_end_time.time().strftime('%I:%M %p')})" for mod in group_mods.values()])
                 embed.add_field(name=group, value=", ".join(names), inline=True)
             else:
                 embed.add_field(name=group, value="¯\\_(ツ)_/¯", inline=True)
