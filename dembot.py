@@ -221,6 +221,7 @@ async def mod_shift_tracker(interaction: discord.Interaction):
     embed = moderator_tracker.get_embed()
     view = ShiftView()
     await interaction.response.send_message(embed=embed, view=view)
+    await update_shift_tracker_message()
 
 # Handle errors for mod_checkin command
 @mod_shift_tracker.error
