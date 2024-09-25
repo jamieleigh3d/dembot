@@ -2,7 +2,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import pytz
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import os
 
@@ -10,10 +10,9 @@ import os
 class ScheduleEntry:
     moderator_name: str
     discord_username: str
-    shift_date: datetime.date
-    shift_start: datetime.time
-    shift_end: datetime.time
-    role: str  # e.g., 'Moderator', 'Lead Moderator'
+    shift_start_datetime: datetime
+    shift_end_datetime: datetime
+    role: str  # e.g., 'Mod', 'Lead Mod', 'Overflow'
 
 class ScheduleSheet:
     def __init__(self, sheet_url=None, cred_json=None):
@@ -65,6 +64,7 @@ class ScheduleSheet:
         FIELD_SHIFT_START = 'Shift Start Time (All times Eastern)'
         FIELD_SHIFT_END = 'Shift End Time'
         FIELD_LEAD_MOD = 'Support/Lead Mod (Only mods in this list can edit)'
+        FIELD_OVERFLOW_SHIFT = 'Overflow shift'
         
         # Process the records
         for record in records:
@@ -75,6 +75,7 @@ class ScheduleSheet:
             shift_start_str = record.get(FIELD_SHIFT_START)
             shift_end_str = record.get(FIELD_SHIFT_END)
             lead_mod_name = record.get(FIELD_LEAD_MOD)
+            overflow_mod_name = record.get(FIELD_OVERFLOW_SHIFT)
             
             if not shift_date_str:
                 continue
@@ -87,29 +88,58 @@ class ScheduleSheet:
                 print(f"Could not parse entry {shift_date_str} {shift_start_str} {shift_end_str}")
                 continue
                 
+            eastern = pytz.timezone('US/Eastern')
+
+            # After parsing shift_start and shift_end
+            shift_start_datetime_naive = datetime.combine(shift_date, shift_start)
+            shift_end_datetime_naive = datetime.combine(shift_date, shift_end)
+
+            # Localize to US Eastern Time
+            shift_start_datetime = eastern.localize(shift_start_datetime_naive)
+            shift_end_datetime = eastern.localize(shift_end_datetime_naive)
+
+            if shift_end_datetime <= shift_start_datetime:
+                # Shift crosses midnight; increment shift_end_datetime by one day
+                shift_end_datetime += timedelta(days=1)           
+                
             # Moderator
             entry = ScheduleEntry(
                 moderator_name=moderator_name,
                 discord_username=discord_username,
-                shift_date=shift_date,
-                shift_start=shift_start,
-                shift_end=shift_end,
-                role='Moderator'
+                shift_start_datetime=shift_start_datetime,
+                shift_end_datetime=shift_end_datetime,
+                role='Mod'
             )
+            # Store the entry in schedule_by_date for both dates if the shift crosses midnight
+            dates = [shift_start_datetime.date()]
+            if shift_end_datetime.date() != shift_start_datetime.date():
+                dates.append(shift_end_datetime.date())
+            for date in dates:
+                schedule_by_date[date].append(entry)
             
             # Lead Moderator
-            lead_entry = ScheduleEntry(
-                moderator_name=lead_mod_name,
-                discord_username='TODO',
-                shift_date=shift_date,
-                shift_start=shift_start,
-                shift_end=shift_end,
-                role='Lead Moderator'
-            )
+            if lead_mod_name:
+                lead_entry = ScheduleEntry(
+                    moderator_name=lead_mod_name,
+                    discord_username='',
+                    shift_start_datetime=shift_start_datetime,
+                    shift_end_datetime=shift_end_datetime,
+                    role='Lead Mod'
+                )
+                for date in dates:
+                    schedule_by_date[date].append(lead_entry)
             
-            # Add the entry to the schedule dictionary
-            schedule_by_date[shift_date].append(entry)
-            schedule_by_date[shift_date].append(lead_entry)
+            if overflow_mod_name and overflow_mod_name != 'Not available':
+                overflow_entry = ScheduleEntry(
+                    moderator_name=lead_mod_name,
+                    discord_username='',
+                    shift_start_datetime=shift_start_datetime,
+                    shift_end_datetime=shift_end_datetime,
+                    role='Overflow'
+                )
+                for date in dates:
+                    schedule_by_date[date].append(overflow_entry)
+
         
         return schedule_by_date
                 

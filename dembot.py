@@ -4,7 +4,7 @@ import os
 import requests
 from discord.ext import commands
 from discord.app_commands import MissingPermissions
-from discord import app_commands
+from discord import app_commands, ui
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import logging
@@ -12,10 +12,10 @@ import boto3
 import signal
 import asyncio
 from typing import List
-from schedule import ScheduleSheet
 import pytz
 from datetime import datetime
 from rapidfuzz import fuzz
+from moderator_tracking import CheckedInModerator, ModeratorTracker, user_has_role
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -44,8 +44,8 @@ table = dynamodb.Table('DembotGuildSettings')
 # Regex to detect URLs
 url_regex = re.compile(r'https?://[^\s]+')
 
-# Global variable to hold the schedule entries
-schedule_entries = {}
+# Global variable to hold ModeratorTracker
+moderator_tracker = ModeratorTracker()
 
 class ServerSettings:
     def __init__(self, 
@@ -155,117 +155,140 @@ async def dembot_link_check_error(interaction: discord.Interaction, error):
     if isinstance(error, MissingPermissions):
         await interaction.response.send_message("You need the **Manage Server** permission to use this command.", ephemeral=True)
 
-def match_user(entry, user):
-    """
-    Attempts to match a schedule entry to a Discord user.
-    Returns True if a match is found.
-    """
-    # Get the user's display name and username
-    user_display_name = user.display_name.lower()
-    user_name = user.name.lower()
-    user_tag = str(user).lower()  # e.g., "username#1234"
+# Define the button view
+class ShiftView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    # Combine possible names to match against
-    user_names = [user_display_name, user_name, user_tag]
+        # Create buttons
+        self.add_item(CheckInButton())
+        self.add_item(CheckOutButton())
+        self.add_item(RefreshButton())
 
-    # Clean and normalize the entry's discord username and moderator name
-    entry_discord_username = entry.discord_username or ""
-    entry_moderator_name = entry.moderator_name or ""
-
-    # Possible names from the schedule entry
-    entry_names = [entry_discord_username.lower(), entry_moderator_name.lower()]
-
-    # Preprocess the entry names: remove extra spaces, parentheses, etc.
-    entry_names_cleaned = []
-    for name in entry_names:
-        # Remove extraneous characters
-        name_cleaned = re.sub(r"[\(\)\[\]]", "", name)
-        name_cleaned = name_cleaned.strip()
-        entry_names_cleaned.append(name_cleaned)
-
-    # Attempt to extract Discord tags from entry names
-    entry_discord_tags = []
-    for name in entry_names_cleaned:
-        tag = extract_discord_tag(name)
-        if tag:
-            entry_discord_tags.append(tag.lower())
-
-    # Matching logic
-    # 1. Exact match on Discord tags
-    if user_tag in entry_discord_tags:
-        return True
-
-    # 2. Fuzzy matching and substring matching
-    for user_name_variant in user_names:
-        for entry_name in entry_names_cleaned:
-            # Fuzzy matching
-            similarity = fuzz.token_set_ratio(user_name_variant, entry_name)
-            if similarity >= 85:  # Adjust threshold as needed
-                return True
-            # Substring matching
-            if user_name_variant in entry_name or entry_name in user_name_variant:
-                return True
-
-    # No match found
-    return False
-
-def extract_discord_tag(text):
-    # Regex pattern for Discord username with discriminator
-    pattern = r'([a-zA-Z0-9_]+)#(\d{4})'
-    match = re.search(pattern, text)
-    if match:
-        return f"{match.group(1)}#{match.group(2)}"
-    return None
-        
-@bot.tree.command(name="mod-checkin", description="Check in for your moderator shift")
-@app_commands.checks.has_any_role('Moderator', 'Community Moderator')
-async def mod_checkin(interaction: discord.Interaction):
-    global schedule_entries
-    user_id = interaction.user.id
-    display_name = interaction.user.display_name
-    guild_id = interaction.guild.id
-    current_time = datetime.now(pytz.utc)
-
-    # Convert current time to Eastern Time (assuming schedule is in Eastern Time)
-    eastern = pytz.timezone('US/Eastern')
-    current_time_est = current_time.astimezone(eastern)
-    current_date = current_time_est.date()
-    current_time_only = current_time_est.time()
-
-    # Find the user's scheduled shift
-    user_schedule = schedule_entries.get(current_date, [])
-    shift_found = False
-    for entry in user_schedule:
-        if match_user(entry, interaction.user):
-            # Check if current time is within the shift time
-            if entry.shift_start <= current_time_only <= entry.shift_end:
-                shift_found = True
-                break
-
-    # Save check-in time to DynamoDB
-    #check_in_mod(user_id, guild_id, current_time)
-    user_display_name = interaction.user.display_name
-    user_name = interaction.user.name
-    user_tag = str(interaction.user)  # e.g., "username#1234"
-
-    logging.info(f"A mod checked in! user_id {user_id} Display name: {user_display_name} Username: {user_name} Tag: {user_tag}")
     
-    if shift_found:
-        await interaction.response.send_message(f"Thank you, {interaction.user.mention}. You are now checked in for your scheduled shift.")
-    else:
-        await interaction.response.send_message(f"Thank you, {interaction.user.mention}. I couldn't find you on the schedule for a scheduled shift right now, but you have been checked in as *f l o a t i n g*.")
+class CheckInButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Check In", style=discord.ButtonStyle.primary)
+
+    async def callback(self, interaction: discord.Interaction):
+        global moderator_tracker
+        required_role_names = ['Moderator', 'Community Moderator']
+
+        if user_has_role(interaction.user, role_names=required_role_names):
+            await moderator_tracker.mod_checkin(interaction)
+            embed = moderator_tracker.get_embed()
+            await interaction.message.edit(embed=embed, view=ShiftView())
+        else:
+            await interaction.response.send_message("You do not have permission to use this button", ephemeral=True)
+            
+class CheckOutButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Check Out", style=discord.ButtonStyle.danger)
+
+    async def callback(self, interaction: discord.Interaction):
+        global moderator_tracker
+        required_role_names = ['Moderator', 'Community Moderator']
+
+        if user_has_role(interaction.user, role_names=required_role_names):
+            await moderator_tracker.mod_checkout(interaction)
+            embed = moderator_tracker.get_embed()
+            await interaction.message.edit(embed=embed, view=ShiftView())
+        else:
+            await interaction.response.send_message("You do not have permission to use this button", ephemeral=True)
+        
+class RefreshButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄")
+
+    async def callback(self, interaction: discord.Interaction):
+        global moderator_tracker
+        try:
+            await interaction.response.defer()
+            moderator_tracker.refresh_schedule()
+            embed = moderator_tracker.get_embed()
+            await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=ShiftView())
+        except Exception as e:
+            logging.error(f"Error in RefreshButton: {str(e)}")
+            # Check if the interaction response has been sent
+            if not interaction.response.is_done():
+                await interaction.response.send_message("An error occurred while refreshing.", ephemeral=True)
+
+# Slash command to send the embed with buttons
+@bot.tree.command(name="mod-shift-tracker", description="Display the shift tracker")
+@app_commands.checks.has_any_role('Moderator', 'Community Moderator')
+async def mod_shift_tracker(interaction: discord.Interaction):
+    moderator_tracker.refresh_schedule()
+    embed = moderator_tracker.get_embed()
+    view = ShiftView()
+    await interaction.response.send_message(embed=embed, view=view)
+
+# Handle errors for mod_checkin command
+@mod_shift_tracker.error
+async def mod_shift_tracker_error(interaction: discord.Interaction, error):
+    if isinstance(error, discord.app_commands.errors.MissingAnyRole):
+        await interaction.response.send_message(str(error), ephemeral=True)
+
+async def auto_check_out_task():
+    global moderator_tracker
+    while True:
+        moderator_tracker.auto_check_out_moderators()
+        await asyncio.sleep(300)  # Run every 5 minutes
         
 async def refresh_schedule_task():
-    global schedule_entries
+    global moderator_tracker
     while True:
-        try:
-            schedule_sheet = ScheduleSheet()
-            schedule_entries = schedule_sheet.get_schedule_entries()
-            logging.info("Schedule refreshed successfully.")
-        except Exception as e:
-            logging.error(f"Error refreshing schedule: {e}")
-        await asyncio.sleep(600)  # Sleep for 10 minutes
+        moderator_tracker.refresh_schedule()
+        await asyncio.sleep(300)  # Sleep for 5 minutes
 
+async def shift_tracker_task():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        # Get current shift times
+        shift_start_time, shift_end_time = moderator_tracker.get_current_shift_times()
+        # Check if the shift has changed
+        if shift_start_time != moderator_tracker.current_shift_start or shift_end_time != moderator_tracker.current_shift_end:
+            # Update the current shift times
+            moderator_tracker.current_shift_start = shift_start_time
+            moderator_tracker.current_shift_end = shift_end_time
+            # Update or send the shift tracker message
+            await update_shift_tracker_message()
+        await asyncio.sleep(60)  # Check every minute
+        
+async def update_shift_tracker_message():
+    channel_id = moderator_tracker.shift_tracker_channel_id
+    message_id = moderator_tracker.shift_tracker_message_id
+
+    if not channel_id:
+        # Assign the channel ID where the shift tracker should be posted
+        # Replace with your channel ID
+        channel_id = 1288387850261495870  # Replace with actual channel ID
+        moderator_tracker.shift_tracker_channel_id = channel_id
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        logging.error(f"Shift tracker channel not found: {channel_id}")
+        return
+
+    embed = moderator_tracker.get_embed()
+    view = ShiftView()
+
+    try:
+        if message_id:
+            # Try to fetch the existing message
+            message = await channel.fetch_message(message_id)
+            await message.edit(embed=embed, view=view)
+        else:
+            # Send a new message
+            message = await channel.send(embed=embed, view=view)
+            moderator_tracker.shift_tracker_message_id = message.id
+    except discord.NotFound:
+        # Message was deleted, send a new one
+        message = await channel.send(embed=embed, view=view)
+        moderator_tracker.shift_tracker_message_id = message.id
+    except Exception as e:
+        logging.error(f"Error updating shift tracker message: {e}")
+
+        
 @bot.command()
 @commands.guild_only()
 @commands.is_owner()
@@ -278,7 +301,7 @@ async def sync(ctx):
 # Called when bot is ready to go
 @bot.event
 async def on_ready():
-    global schedule_entries
+    global moderator_tracker
     logging.info(f"discord.py version: {discord.__version__}")
     
     for guild in bot.guilds:
@@ -304,14 +327,12 @@ async def on_ready():
     logging.info(f"Bot is ready! Logged in as {bot.user} (ID: {bot.user.id})")
     logging.info(f"Application ID: {bot.application_id}")
     
-    # Create an instance of ScheduleSheet
-    schedule_sheet = ScheduleSheet()
-    
-    # Load the schedule entries
-    schedule_entries = schedule_sheet.get_schedule_entries()
+    moderator_tracker.refresh_schedule()
     
     # Start a background task to refresh the schedule periodically
     bot.loop.create_task(refresh_schedule_task())
+    bot.loop.create_task(auto_check_out_task())
+    bot.loop.create_task(shift_tracker_task())
     
     logging.info(f'Schedule loaded')
 
