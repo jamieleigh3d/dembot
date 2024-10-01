@@ -62,13 +62,22 @@ class CheckedInModerator:
         current_time = datetime.now(pytz.timezone('US/Eastern'))
         return current_time >= self.shift_end_time
 
-class ModeratorTracker:
+class ModeratorTrackerManager:
     def __init__(self):
+        # Dictionary to hold ModeratorTracker instances per guild
+        self.trackers = {}
+
+    def get_tracker(self, guild_id):
+        if guild_id not in self.trackers:
+            self.trackers[guild_id] = ModeratorTracker(guild_id)
+        return self.trackers[guild_id]
+        
+class ModeratorTracker:
+    def __init__(self, guild_id):
+        self.guild_id = guild_id
         # Dictionary to hold moderators by group
         self.moderators = defaultdict(dict)  # {group: {user_id: CheckedInModerator}}
         self.schedule_entries = {}
-        self.shift_tracker_message_id = None
-        self.shift_tracker_channel_id = None
         self.current_shift_start = None
         self.current_shift_end = None
 
@@ -217,7 +226,7 @@ class ModeratorTracker:
         try:
             schedule_sheet = ScheduleSheet()
             self.schedule_entries = schedule_sheet.get_schedule_entries()
-            logging.info("Schedule refreshed successfully.")
+            logging.info(f"Schedule refreshed successfully for guild {self.guild_id}.")
         except Exception as e:
             logging.error(f"Error refreshing schedule: {e}")
             

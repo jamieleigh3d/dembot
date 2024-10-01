@@ -1,7 +1,7 @@
-import discord
+﻿import discord
 import re
 import os
-import requests
+import aiohttp
 from discord.ext import commands
 from discord.app_commands import MissingPermissions
 from discord import app_commands, ui
@@ -16,6 +16,7 @@ import pytz
 from datetime import datetime
 from rapidfuzz import fuzz
 from moderator_tracking import CheckedInModerator, ModeratorTracker, user_has_role
+from moderator_tracking import ModeratorTrackerManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -45,16 +46,20 @@ table = dynamodb.Table('DembotGuildSettings')
 url_regex = re.compile(r'https?://[^\s]+')
 
 # Global variable to hold ModeratorTracker
-moderator_tracker = ModeratorTracker()
+tracker_manager = ModeratorTrackerManager()
 
 class ServerSettings:
     def __init__(self, 
                 logging_channel_id=None, 
                 link_check_enabled=False, 
-                 authorized_role_ids=None):
+                authorized_role_ids=None,
+                shift_tracker_channel_id=None,
+                shift_tracker_message_id=None):
         self.logging_channel_id = logging_channel_id
         self.link_check_enabled = link_check_enabled
         self.authorized_role_ids = authorized_role_ids or []
+        self.shift_tracker_channel_id = shift_tracker_channel_id
+        self.shift_tracker_message_id = shift_tracker_message_id
 
 def has_authorized_role(interaction: discord.Interaction, authorized_role_ids):
     """Check if the user has any role in the authorized roles list."""
@@ -155,6 +160,30 @@ async def dembot_link_check_error(interaction: discord.Interaction, error):
     if isinstance(error, MissingPermissions):
         await interaction.response.send_message("You need the **Manage Server** permission to use this command.", ephemeral=True)
 
+@bot.tree.command(name="dembot-set-shift-tracker-channel", description="Set the channel where the shift tracker is posted")
+@app_commands.describe(channel="The channel where the shift tracker should be sent")
+async def dembot_set_shift_tracker_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    # Check if the user has Manage Server permission or an authorized role
+    if not interaction.user.guild_permissions.manage_guild and not has_authorized_role(interaction, settings.authorized_role_ids):
+        await interaction.response.send_message("You don't have permission to run this command.", ephemeral=True)
+        return
+        
+    guild_id = interaction.guild.id
+    settings = get_server_settings(guild_id)
+
+    settings.shift_tracker_channel_id = channel.id
+    save_server_settings(guild_id, settings)
+
+    await interaction.response.send_message(f"Shift tracker channel set to {channel.mention}")
+
+@dembot_set_shift_tracker_channel.error
+async def dembot_set_shift_tracker_channel_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need the **Manage Server** or delegated permission to use this command.", ephemeral=True)
+    else:
+        await interaction.response.send_message("An error occurred.", ephemeral=True)
+
+        
 # Define the button view
 class ShiftView(discord.ui.View):
     def __init__(self):
@@ -175,9 +204,11 @@ class CheckInButton(discord.ui.Button):
         required_role_names = ['Moderator', 'Community Moderator']
 
         if user_has_role(interaction.user, role_names=required_role_names):
+            guild_id = interaction.guild.id
+            moderator_tracker = tracker_manager.get_tracker(guild_id)
             await moderator_tracker.mod_checkin(interaction)
             embed = moderator_tracker.get_embed()
-            await interaction.message.edit(embed=embed, view=ShiftView())
+            await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=ShiftView())
         else:
             await interaction.response.send_message("You do not have permission to use this button", ephemeral=True)
             
@@ -190,9 +221,11 @@ class CheckOutButton(discord.ui.Button):
         required_role_names = ['Moderator', 'Community Moderator']
 
         if user_has_role(interaction.user, role_names=required_role_names):
+            guild_id = interaction.guild.id
+            moderator_tracker = tracker_manager.get_tracker(guild_id)
             await moderator_tracker.mod_checkout(interaction)
             embed = moderator_tracker.get_embed()
-            await interaction.message.edit(embed=embed, view=ShiftView())
+            await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=ShiftView())
         else:
             await interaction.response.send_message("You do not have permission to use this button", ephemeral=True)
         
@@ -204,6 +237,8 @@ class RefreshButton(discord.ui.Button):
         global moderator_tracker
         try:
             await interaction.response.defer()
+            guild_id = interaction.guild.id
+            moderator_tracker = tracker_manager.get_tracker(guild_id)
             moderator_tracker.refresh_schedule()
             embed = moderator_tracker.get_embed()
             await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=ShiftView())
@@ -217,11 +252,11 @@ class RefreshButton(discord.ui.Button):
 @bot.tree.command(name="mod-shift-tracker", description="Display the shift tracker")
 @app_commands.checks.has_any_role('Moderator', 'Community Moderator')
 async def mod_shift_tracker(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    await interaction.response.defer()
+    moderator_tracker = tracker_manager.get_tracker(guild_id)
     moderator_tracker.refresh_schedule()
-    embed = moderator_tracker.get_embed()
-    view = ShiftView()
-    await interaction.response.send_message(embed=embed, view=view)
-    await update_shift_tracker_message()
+    await update_shift_tracker_message(guild_id)
 
 # Handle errors for mod_checkin command
 @mod_shift_tracker.error
@@ -230,50 +265,63 @@ async def mod_shift_tracker_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(str(error), ephemeral=True)
 
 async def auto_check_out_task():
-    global moderator_tracker
     while True:
-        moderator_tracker.auto_check_out_moderators()
+        for guild in bot.guilds:
+            guild_id = guild.id
+            moderator_tracker = tracker_manager.get_tracker(guild_id)
+            moderator_tracker.auto_check_out_moderators()
         await asyncio.sleep(300)  # Run every 5 minutes
         
 async def refresh_schedule_task():
-    global moderator_tracker
     while True:
-        moderator_tracker.refresh_schedule()
+        for guild in bot.guilds:
+            guild_id = guild.id
+            moderator_tracker = tracker_manager.get_tracker(guild_id)
+            moderator_tracker.refresh_schedule()
         await asyncio.sleep(300)  # Sleep for 5 minutes
 
 async def shift_tracker_task():
     await bot.wait_until_ready()
     while not bot.is_closed():
-        # Get current shift times
-        shift_start_time, shift_end_time = moderator_tracker.get_current_shift_times()
-        # Check if the shift has changed
-        if shift_start_time != moderator_tracker.current_shift_start or shift_end_time != moderator_tracker.current_shift_end:
-            # Update the current shift times
-            moderator_tracker.current_shift_start = shift_start_time
-            moderator_tracker.current_shift_end = shift_end_time
-            # Update or send the shift tracker message
-            await update_shift_tracker_message()
+        for guild in bot.guilds:
+            guild_id = guild.id
+            moderator_tracker = tracker_manager.get_tracker(guild_id)
+            
+            # Get current shift times
+            shift_start_time, shift_end_time = moderator_tracker.get_current_shift_times()
+            # Check if the shift has changed
+            if shift_start_time != moderator_tracker.current_shift_start or shift_end_time != moderator_tracker.current_shift_end:
+                # Update the current shift times
+                moderator_tracker.current_shift_start = shift_start_time
+                moderator_tracker.current_shift_end = shift_end_time
+                # Update or send the shift tracker message
+                await update_shift_tracker_message(guild_id)
         await asyncio.sleep(60)  # Check every minute
         
-async def update_shift_tracker_message():
-    channel_id = moderator_tracker.shift_tracker_channel_id
-    message_id = moderator_tracker.shift_tracker_message_id
+async def update_shift_tracker_message(guild_id):
+    moderator_tracker = tracker_manager.get_tracker(guild_id)
+    settings = get_server_settings(guild_id)
+    channel_id = settings.shift_tracker_channel_id
 
     if not channel_id:
         # Assign the channel ID where the shift tracker should be posted
-        # Replace with your channel ID
-        channel_id = 1288387850261495870  # Replace with actual channel ID
-        moderator_tracker.shift_tracker_channel_id = channel_id
+        # Fetch from server settings or use a default channel per guild
+        settings = get_server_settings(guild_id)
+        channel_id = settings.shift_tracker_channel_id
+        if not channel_id:
+            logging.warning(f"No shift tracker channel set for guild {guild_id}")
+            return  # Skip this guild
 
     channel = bot.get_channel(channel_id)
     if not channel:
-        logging.error(f"Shift tracker channel not found: {channel_id}")
-        return
+        logging.warning(f"Shift tracker channel not found: {channel_id} in guild {guild_id}")
+        return  # Skip this guild
 
     embed = moderator_tracker.get_embed()
     view = ShiftView()
 
     try:
+        message_id = settings.shift_tracker_message_id
         if message_id:
             # Try to fetch the existing message
             message = await channel.fetch_message(message_id)
@@ -281,13 +329,15 @@ async def update_shift_tracker_message():
         else:
             # Send a new message
             message = await channel.send(embed=embed, view=view)
-            moderator_tracker.shift_tracker_message_id = message.id
+            settings.shift_tracker_message_id = message.id
+            save_server_settings(guild_id, settings)
     except discord.NotFound:
         # Message was deleted, send a new one
         message = await channel.send(embed=embed, view=view)
-        moderator_tracker.shift_tracker_message_id = message.id
+        settings.shift_tracker_message_id = message.id
+        save_server_settings(guild_id, settings)
     except Exception as e:
-        logging.error(f"Error updating shift tracker message: {e}")
+        logging.error(f"Error updating shift tracker message in guild {guild_id}: {e}")
 
         
 @bot.command()
@@ -307,28 +357,22 @@ async def on_ready():
     
     for guild in bot.guilds:
         logging.info(f"Connected to guild: {guild.name} (ID: {guild.id})")
-    
+        guild_id = guild.id
+        moderator_tracker = tracker_manager.get_tracker(guild_id)
+        moderator_tracker.refresh_schedule()
+        
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        logging.info(f"Synced {len(synced)} commands to the server.")
+        
     # Print registered commands
     commands = bot.tree.get_commands()
     logging.info(f"Commands registered: {len(commands)}")
     for cmd in commands:
         logging.info(f"Command: {cmd.name}")
-        
-    try:
-        # Sync the slash commands to the server
-        guild = discord.Object(id=769864349594419241) # ID for Fortunae Beta test server
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        logging.info(f"Synced {len(synced)} commands to the server.")
-    except Exception as e:
-        logging.error(f"An error occurred during sync: {e}")
     
-    #await bot.tree.sync()
-    #logging.info(f"Slash commands synced for {bot.user}")
     logging.info(f"Bot is ready! Logged in as {bot.user} (ID: {bot.user.id})")
     logging.info(f"Application ID: {bot.application_id}")
-    
-    moderator_tracker.refresh_schedule()
     
     # Start a background task to refresh the schedule periodically
     bot.loop.create_task(refresh_schedule_task())
@@ -362,24 +406,30 @@ def get_server_settings(guild_id):
             
             # Get whether link checking is enabled
             link_check_enabled = safe_cast_to_bool(item.get('LinkCheckEnabled', None), False)
-            
+
             # Get the ChannelID as an integer, or else None
             logging_channel_id = safe_cast_to_int(item.get('LinkLoggingChannelID', None), None)
-            
+
             # Roles authorized to perform configuration slash commands
             authorized_role_ids = item.get('DembotAuthorizedRoleIds', [])
+
+            shift_tracker_channel_id = safe_cast_to_int(item.get('ShiftTrackerChannelID', None), None)
+
+            shift_tracker_message_id = safe_cast_to_int(item.get('ShiftTrackerMessageId', None), None)
             
-            return ServerSettings(link_check_enabled=link_check_enabled,
-                                  logging_channel_id=logging_channel_id,
-                                  authorized_role_ids=authorized_role_ids)
+            return ServerSettings(
+                link_check_enabled=link_check_enabled,
+                logging_channel_id=logging_channel_id,
+                authorized_role_ids=authorized_role_ids,
+                shift_tracker_channel_id=shift_tracker_channel_id,
+                shift_tracker_message_id=shift_tracker_message_id
+            )
         else:
-            logging.warning(f"No server settings found for guild {guild_id}, using defaults")
             return ServerSettings()
     except Exception as e:
         logging.error(f"Error retrieving server settings for guild {guild_id}: {e}")
         return ServerSettings()
 
-# Save the server settings for a particular guild
 def save_server_settings(guild_id, settings : ServerSettings):
     try:
         table.put_item(
@@ -387,7 +437,9 @@ def save_server_settings(guild_id, settings : ServerSettings):
                 'GuildID': str(guild_id),
                 'LinkCheckEnabled': settings.link_check_enabled,
                 'LinkLoggingChannelID': settings.logging_channel_id,
-                'DembotAuthorizedRoleIds': settings.authorized_role_ids
+                'DembotAuthorizedRoleIds': settings.authorized_role_ids,
+                'ShiftTrackerChannelID': settings.shift_tracker_channel_id,
+                'ShiftTrackerMessageId': settings.shift_tracker_message_id
             }
         )
     except Exception as e:
@@ -438,52 +490,48 @@ async def run_link_check(message, settings):
     # Find links in the message
     links = url_regex.findall(message.content)
     if links:
-        for link in links:
-            logging.info(f"Checking link: {link}")
-            try:
-                # Download the content of the link
-                response = requests.get(link, timeout=10)
-                #The requests library handles 3xx redirects automatically
-                
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.content, 'html.parser')
+        async with aiohttp.ClientSession() as session:
+            for link in links:
+                logging.info(f"Checking link: {link}")
+                try:
+                    async with session.get(link, timeout=10) as response:
+                        if response.status == 200:
+                            content = await response.text()
+                            soup = BeautifulSoup(content, 'html.parser')
 
-                    # Define the keywords to search for
-                    keywords = ["donate", "donation", "fundraise", "fundraising", "merch", "add to cart"]
+                            # Define the keywords to search for
+                            keywords = ["donate", "donation", "fundraise", "fundraising", "merch", "add to cart"]
 
-                    # Build the regex pattern with word boundaries
-                    pattern = re.compile(r'(' + '|'.join(map(re.escape, keywords)) + r')', re.I)
+                            # Build the regex pattern with word boundaries
+                            pattern = re.compile(r'(' + '|'.join(map(re.escape, keywords)) + r')', re.I)
 
-                    # Initialize a set to store matched keywords
-                    matched_keywords = set()
-                    matched_url_keywords = set()
+                            # Initialize a set to store matched keywords
+                            matched_keywords = set()
+                            matched_url_keywords = set()
 
-                    # Check for keywords in text
-                    donate_buttons = soup.find_all(string=pattern)
-                    for element in donate_buttons:
-                        matches = pattern.findall(element)
-                        matched_keywords.update(matches)
+                            # Check for keywords in text
+                            donate_buttons = soup.find_all(string=pattern)
+                            for element in donate_buttons:
+                                matches = pattern.findall(element)
+                                matched_keywords.update(matches)
 
-                    # Check for keywords in link href attributes
-                    donate_links = soup.find_all('a', href=pattern)
-                    for a_tag in donate_links:
-                        href = a_tag.get('href', '')
-                        matches = pattern.findall(href)
-                        matched_url_keywords.update(matches)
+                            # Check for keywords in link href attributes
+                            donate_links = soup.find_all('a', href=pattern)
+                            for a_tag in donate_links:
+                                href = a_tag.get('href', '')
+                                matches = pattern.findall(href)
+                                matched_url_keywords.update(matches)
 
-                    if matched_keywords or matched_url_keywords:
-                        logging.info(f"Potential fundraising-related content found in {link}")
-                        await log_link(message, link, settings, matched_keywords, matched_url_keywords)
-                        break
-                    else:
-                        logging.info(f"No fundraising-related content found in {link}")
-                        
-            except requests.exceptions.Timeout:
-                logging.error(f"Timeout error accessing {link}")
-            except requests.exceptions.TooManyRedirects:
-                logging.error(f"Too many redirects for {link}")
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Error accessing {link}: {e}")
+                            if matched_keywords or matched_url_keywords:
+                                logging.info(f"Potential fundraising-related content found in {link}")
+                                await log_link(message, link, settings, matched_keywords, matched_url_keywords)
+                                break
+                            else:
+                                logging.info(f"No fundraising-related content found in {link}")
+                except asyncio.TimeoutError:
+                    logging.error(f"Timeout error accessing {link}")
+                except aiohttp.ClientError as e:
+                    logging.error(f"Error accessing {link}: {e}")
 
             
 # When a message is received
@@ -496,7 +544,11 @@ async def on_message(message):
     settings = get_server_settings(message.guild.id)
 
     if settings.link_check_enabled:
-        await run_link_check(message, settings)
+        try:
+            await run_link_check(message, settings)
+        except Exception as e:
+            logging.error(f"Error in run_link_check for guild {message.guild.id}: {e}")
+
 
     await bot.process_commands(message)
 
